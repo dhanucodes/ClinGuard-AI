@@ -1,25 +1,33 @@
+
 """FastAPI application for ClinGuard AI."""
-from clinguard.backend.processing import process_patient_history
+
 import pandas as pd
+
 from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from clinguard.database.session import get_db
-
+from clinguard.database.models import (
+    VitalReading,
+    DetectionResult,
+    VerificationResult,
+)
 from clinguard.database.crud import (
     create_patient,
     get_patient,
     create_vital_reading,
     get_patient_readings,
+    save_detection_and_verification,
 )
-
 from clinguard.backend.schemas import (
     PatientCreate,
     PatientResponse,
     VitalReadingCreate,
     VitalReadingResponse,
 )
+from clinguard.backend.processing import process_patient_history
 
 
 app = FastAPI(
@@ -49,11 +57,7 @@ def register_patient(
     patient_data: PatientCreate,
     db: Session = Depends(get_db),
 ):
-
-    existing_patient = get_patient(
-        db,
-        patient_data.patient_id,
-    )
+    existing_patient = get_patient(db, patient_data.patient_id)
 
     if existing_patient:
         raise HTTPException(
@@ -62,11 +66,7 @@ def register_patient(
         )
 
     try:
-        patient = create_patient(
-            db,
-            patient_data.patient_id,
-        )
-        return patient
+        return create_patient(db, patient_data.patient_id)
 
     except IntegrityError:
         db.rollback()
@@ -84,7 +84,6 @@ def retrieve_patient(
     patient_id: str,
     db: Session = Depends(get_db),
 ):
-
     patient = get_patient(db, patient_id)
 
     if patient is None:
@@ -105,11 +104,7 @@ def submit_reading(
     reading_data: VitalReadingCreate,
     db: Session = Depends(get_db),
 ):
-
-    patient = get_patient(
-        db,
-        reading_data.patient_id,
-    )
+    patient = get_patient(db, reading_data.patient_id)
 
     if patient is None:
         raise HTTPException(
@@ -118,18 +113,19 @@ def submit_reading(
         )
 
     try:
-        reading = create_vital_reading(
+        return create_vital_reading(
             db,
             reading_data.model_dump(),
         )
-
-        return reading
 
     except IntegrityError:
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail="A reading already exists for this patient and timestamp.",
+            detail=(
+                "A reading already exists for this patient "
+                "and timestamp."
+            ),
         )
 
 
@@ -141,7 +137,6 @@ def retrieve_patient_readings(
     patient_id: str,
     db: Session = Depends(get_db),
 ):
-
     patient = get_patient(db, patient_id)
 
     if patient is None:
@@ -151,19 +146,21 @@ def retrieve_patient_readings(
         )
 
     return get_patient_readings(db, patient_id)
-@app.post("/patients/{patient_id}/process")
-def process_patient(patient_id: str, db: Session = Depends(get_db)):
 
-    # 1. Check whether the patient exists.
+
+@app.post("/patients/{patient_id}/process")
+def process_patient(
+    patient_id: str,
+    db: Session = Depends(get_db),
+):
     patient = get_patient(db, patient_id)
 
     if patient is None:
         raise HTTPException(
             status_code=404,
-            detail="Patient not found."
+            detail="Patient not found.",
         )
 
-    # 2. Retrieve the patient's stored readings.
     readings = get_patient_readings(db, patient_id)
 
     if len(readings) < 7:
@@ -178,9 +175,9 @@ def process_patient(patient_id: str, db: Session = Depends(get_db)):
             "required_readings": 7,
         }
 
-    # 3. Convert database records into a DataFrame.
     records = [
         {
+            "reading_id": reading.reading_id,
             "patient_id": reading.patient_id,
             "timestamp": reading.timestamp,
             "heart_rate": reading.heart_rate,
@@ -199,23 +196,65 @@ def process_patient(patient_id: str, db: Session = Depends(get_db)):
 
     patient_history = pd.DataFrame(records)
 
-    # 4. Run the AI processing pipeline.
     try:
         result = process_patient_history(patient_history)
 
     except ValueError as error:
         raise HTTPException(
             status_code=422,
-            detail=str(error)
+            detail=str(error),
         )
 
-    # 5. Return the processing summary.
-    latest_record = result["dataset"].iloc[-1]
+    processed_dataset = result["dataset"]
+
+    for _, row in processed_dataset.iterrows():
+
+        score = row["isolation_forest_score"]
+
+        if pd.isna(score):
+            score = None
+        else:
+            score = float(score)
+
+        detection_data = {
+            "statistical_anomaly_flag": bool(
+                row["statistical_anomaly_flag"]
+            ),
+            "isolation_forest_anomaly_flag": bool(
+                row["isolation_forest_anomaly_flag"]
+            ),
+            "hybrid_or_flag": bool(row["hybrid_or_flag"]),
+            "hybrid_and_flag": bool(row["hybrid_and_flag"]),
+            "isolation_forest_score": score,
+        }
+
+        verification_data = {
+            "verification_status": str(
+                row["verification_status"]
+            ),
+            "verification_reason": str(
+                row["verification_reason"]
+            ),
+            "context_issues": str(row["context_issues"]),
+            "explainable_reason": str(
+                row["explainable_reason"]
+            ),
+        }
+
+        save_detection_and_verification(
+            db=db,
+            reading_id=int(row["reading_id"]),
+            detection_data=detection_data,
+            verification_data=verification_data,
+        )
+
+    latest_record = processed_dataset.iloc[-1]
 
     return {
         "status": result["status"],
         "patient_id": patient_id,
-        "total_records": len(result["dataset"]),
+        "total_records": len(processed_dataset),
+        "saved_results": len(processed_dataset),
         "summary": result["summary"],
         "latest_record": {
             "timestamp": str(latest_record["timestamp"]),
@@ -226,4 +265,97 @@ def process_patient(patient_id: str, db: Session = Depends(get_db)):
                 latest_record["explainable_reason"]
             ),
         },
+    }
+
+
+# NEW ENDPOINT 1: Retrieve saved detection results.
+
+
+@app.get("/patients/{patient_id}/detections")
+def retrieve_patient_detections(
+    patient_id: str,
+    db: Session = Depends(get_db),
+):
+    patient = get_patient(db, patient_id)
+
+    if patient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found.",
+        )
+
+    statement = (
+        select(
+            VitalReading.reading_id,
+            VitalReading.timestamp,
+            DetectionResult.detection_id,
+            DetectionResult.statistical_anomaly_flag,
+            DetectionResult.isolation_forest_anomaly_flag,
+            DetectionResult.hybrid_or_flag,
+            DetectionResult.hybrid_and_flag,
+            DetectionResult.isolation_forest_score,
+        )
+        .join(
+            DetectionResult,
+            DetectionResult.reading_id == VitalReading.reading_id,
+        )
+        .where(VitalReading.patient_id == patient_id)
+        .order_by(VitalReading.timestamp)
+    )
+
+    results = db.execute(statement).mappings().all()
+
+    return {
+        "patient_id": patient_id,
+        "total_results": len(results),
+        "detections": [dict(row) for row in results],
+    }
+
+
+# NEW ENDPOINT 2: Retrieve saved verification results.
+
+
+@app.get("/patients/{patient_id}/verifications")
+def retrieve_patient_verifications(
+    patient_id: str,
+    db: Session = Depends(get_db),
+):
+    patient = get_patient(db, patient_id)
+
+    if patient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found.",
+        )
+
+    statement = (
+        select(
+            VitalReading.reading_id,
+            VitalReading.timestamp,
+            DetectionResult.detection_id,
+            VerificationResult.verification_id,
+            VerificationResult.verification_status,
+            VerificationResult.verification_reason,
+            VerificationResult.context_issues,
+            VerificationResult.explainable_reason,
+        )
+        .join(
+            DetectionResult,
+            DetectionResult.reading_id == VitalReading.reading_id,
+        )
+        .join(
+            VerificationResult,
+            VerificationResult.detection_id
+            == DetectionResult.detection_id,
+        )
+        .where(VitalReading.patient_id == patient_id)
+        .order_by(VitalReading.timestamp)
+    )
+
+    results = db.execute(statement).mappings().all()
+
+    return {
+        "patient_id": patient_id,
+        "total_results": len(results),
+        "verifications": [dict(row) for row in results],
     }
